@@ -296,18 +296,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { await self.refreshAndRender() }
         Timer.scheduledTimer(withTimeInterval: 120, repeats: true) { [weak self] _ in
             Task { @MainActor in
+                guard self?.controller.canStartAccountAction == true else { return }
                 await self?.refreshAndRender()
             }
         }
     }
 
     private func refreshAndRender() async {
+        guard self.controller.canStartAccountAction else { return }
         await self.controller.refresh()
         await self.controller.autoBalanceIfNeeded(settings: self.loadBalancerSettings)
         self.render()
     }
 
-    private func render() {
+    private func render(updateMenu: Bool = true) {
         let rows = self.controller.accounts
         if rows.isEmpty {
             self.statusItem.length = NSStatusItem.variableLength
@@ -319,7 +321,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 : UsageMath.combined(rows.map(\.snapshot))
             self.renderStatusItem(snapshot: source)
         }
-        self.statusItem.menu = self.makeMenu()
+        if updateMenu {
+            self.statusItem.menu = self.makeMenu()
+        }
     }
 
     private func renderStatusItem(snapshot: UsageSnapshot?) {
@@ -352,21 +356,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             controller: self.controller,
             settings: self.settings,
             onSwitch: { [weak self] name in self?.switchAccount(named: name) },
-            onEdit: { [weak self] account in self?.editAccount(account) }))
+            onEdit: { [weak self] account in self?.editAccount(account) },
+            onDelete: { [weak self] account in self?.deleteAccount(account) }))
         menu.addItem(top)
         menu.addItem(.separator())
 
         let refresh = NSMenuItem(title: "Refresh", action: #selector(refreshNow), keyEquivalent: "r")
         refresh.target = self
+        refresh.isEnabled = self.controller.canStartAccountAction
         menu.addItem(refresh)
 
         let add = NSMenuItem(title: "Add Current Account...", action: #selector(addCurrentAccount), keyEquivalent: "")
         add.target = self
+        add.isEnabled = self.controller.canStartAccountAction
         menu.addItem(add)
 
         let balance = NSMenuItem(title: "Balance Now", action: #selector(balanceNow), keyEquivalent: "b")
         balance.target = self
-        balance.isEnabled = self.loadBalancerSettings.enabled
+        balance.isEnabled = self.loadBalancerSettings.enabled && self.controller.canStartAccountAction
         menu.addItem(balance)
 
         let settingsItem = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
@@ -437,6 +444,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func refreshNow() {
+        guard self.controller.canStartAccountAction else { return }
         Task { await self.refreshAndRender() }
     }
 
@@ -446,9 +454,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func switchAccount(named name: String) {
+        guard self.controller.canStartAccountAction else { return }
+        self.controller.startSwitching(to: name)
+        self.render(updateMenu: false)
         Task {
-            await self.controller.switchToAccount(named: name)
-            self.render()
+            await self.controller.finishSwitching(to: name)
+            self.render(updateMenu: false)
         }
     }
 
@@ -460,6 +471,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func editAccount(_ account: CodexAccountUsage) {
+        guard self.controller.canStartAccountAction else { return }
         let alert = NSAlert()
         alert.messageText = "Edit Account"
         alert.informativeText = "Rename the profile and optional label."
@@ -484,7 +496,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func deleteAccount(_ account: CodexAccountUsage) {
+        guard self.controller.canStartAccountAction else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "Delete Profile?"
+        alert.informativeText = "This removes '\(account.displayName)' from CodexMaxx. Your current ~/.codex files are not deleted."
+        alert.addButton(withTitle: "Delete")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        Task {
+            await self.controller.deleteAccount(named: account.name)
+            self.render()
+        }
+    }
+
     @objc private func addCurrentAccount() {
+        guard self.controller.canStartAccountAction else { return }
         let alert = NSAlert()
         alert.messageText = "Add Current Account"
         alert.informativeText = "This stores the currently active Codex credentials as a new CodexMaxx account."
@@ -559,7 +587,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 final class HostingMenuView<Content: View>: NSHostingView<Content> {
     required init(rootView: Content) {
         super.init(rootView: rootView)
-        self.frame = NSRect(x: 0, y: 0, width: 320, height: 210)
+        self.frame = NSRect(x: 0, y: 0, width: 340, height: 238)
     }
 
     @available(*, unavailable)
@@ -569,10 +597,11 @@ final class HostingMenuView<Content: View>: NSHostingView<Content> {
 }
 
 struct MenuContent: View {
-    let controller: UsageController
+    @ObservedObject var controller: UsageController
     let settings: DisplaySettings
     let onSwitch: (String) -> Void
     let onEdit: (CodexAccountUsage) -> Void
+    let onDelete: (CodexAccountUsage) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 7) {
@@ -593,6 +622,23 @@ struct MenuContent: View {
                     .foregroundStyle(.secondary)
             }
 
+            if let message = controller.statusMessage {
+                HStack(spacing: 5) {
+                    if controller.switchingAccountName != nil {
+                        ProgressView()
+                            .controlSize(.small)
+                            .scaleEffect(0.55)
+                            .frame(width: 12, height: 12)
+                    } else {
+                        Image(systemName: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    }
+                    Text(message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             if let error = controller.lastError {
                 Text(error)
                     .font(.caption)
@@ -607,7 +653,14 @@ struct MenuContent: View {
             Divider()
 
             ForEach(controller.accounts) { account in
-                AccountRow(account: account, settings: settings, onSwitch: onSwitch, onEdit: onEdit)
+                AccountRow(
+                    account: account,
+                    settings: settings,
+                    switchingAccountName: controller.switchingAccountName,
+                    actionsDisabled: !controller.canStartAccountAction,
+                    onSwitch: onSwitch,
+                    onEdit: onEdit,
+                    onDelete: onDelete)
                 if account.id != controller.accounts.last?.id {
                     Divider()
                 }
@@ -616,7 +669,7 @@ struct MenuContent: View {
         .padding(.top, 4)
         .padding(.horizontal, 12)
         .padding(.bottom, 4)
-        .frame(width: 320, alignment: .leading)
+        .frame(width: 340, alignment: .leading)
     }
 }
 
@@ -633,54 +686,90 @@ struct CombinedUsageView: View {
 struct AccountRow: View {
     let account: CodexAccountUsage
     let settings: DisplaySettings
+    let switchingAccountName: String?
+    let actionsDisabled: Bool
     let onSwitch: (String) -> Void
     let onEdit: (CodexAccountUsage) -> Void
+    let onDelete: (CodexAccountUsage) -> Void
 
     var body: some View {
         let wasted = account.isWasted
-        Button(action: { onSwitch(account.name) }) {
-            VStack(alignment: .leading, spacing: 5) {
-                HStack(spacing: 8) {
-                    if account.active {
-                        Image(systemName: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                    } else {
-                        Image(systemName: wasted ? "clock" : "circle")
-                            .foregroundStyle(.secondary)
-                    }
-
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(account.displayName)
-                            .font(.subheadline.weight(.semibold))
-                        if settings.showEmails, !account.emailOrPlan.isEmpty {
-                            Text(account.emailOrPlan)
-                                .font(.caption2)
+        let isSwitching = switchingAccountName == account.name
+        VStack(alignment: .leading, spacing: 5) {
+            HStack(spacing: 8) {
+                Button(action: { onSwitch(account.name) }) {
+                    HStack(spacing: 8) {
+                        if isSwitching {
+                            ProgressView()
+                                .controlSize(.small)
+                                .scaleEffect(0.6)
+                                .frame(width: 16, height: 16)
+                        } else if account.active {
+                            Image(systemName: "checkmark.circle.fill")
+                                .foregroundStyle(.green)
+                        } else {
+                            Image(systemName: wasted ? "clock" : "circle")
                                 .foregroundStyle(.secondary)
                         }
+
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(account.displayName)
+                                .font(.subheadline.weight(.semibold))
+                            if settings.showEmails, !account.emailOrPlan.isEmpty {
+                                Text(account.emailOrPlan)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                     }
-
-                    Spacer()
-
-                    Text(account.statusText)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(wasted ? .secondary : .primary)
                 }
+                .buttonStyle(.plain)
+                .disabled(actionsDisabled || account.active)
 
-                if let snapshot = account.snapshot {
-                    UsageBars(snapshot: snapshot, dimmed: wasted, combined: false, settings: .popup, forceInline: true)
-                } else {
-                    Text(account.error ?? "No usage")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                Spacer()
+
+                Text(isSwitching ? "switching" : account.statusText)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(isSwitching || wasted ? .secondary : .primary)
+
+                HStack(spacing: 4) {
+                    Button(action: { onEdit(account) }) {
+                        Image(systemName: "pencil")
+                            .frame(width: 18, height: 18)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(actionsDisabled)
+                    .help("Edit profile")
+
+                    Button(action: { onDelete(account) }) {
+                        Image(systemName: "trash")
+                            .frame(width: 18, height: 18)
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(actionsDisabled)
+                    .foregroundStyle(.red)
+                    .help("Delete profile")
                 }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+
+            if let snapshot = account.snapshot {
+                UsageBars(snapshot: snapshot, dimmed: wasted, combined: false, settings: .popup, forceInline: true)
+            } else {
+                Text(account.error ?? "No usage")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .buttonStyle(.plain)
         .contextMenu {
             Button("Edit Name/Label") { onEdit(account) }
+                .disabled(actionsDisabled)
+            Button("Delete Profile", role: .destructive) { onDelete(account) }
+                .disabled(actionsDisabled)
         }
-        .opacity(wasted ? 0.45 : 1)
+        .opacity(wasted && !isSwitching ? 0.45 : 1)
     }
 }
 
@@ -777,11 +866,17 @@ struct VisibleUsageBar: Identifiable {
 }
 
 @MainActor
-final class UsageController {
-    private(set) var accounts: [CodexAccountUsage] = []
-    private(set) var updatedAt = Date()
-    private(set) var isRefreshing = false
-    private(set) var lastError: String?
+final class UsageController: ObservableObject {
+    @Published private(set) var accounts: [CodexAccountUsage] = []
+    @Published private(set) var updatedAt = Date()
+    @Published private(set) var isRefreshing = false
+    @Published private(set) var lastError: String?
+    @Published private(set) var switchingAccountName: String?
+    @Published private(set) var statusMessage: String?
+
+    var canStartAccountAction: Bool {
+        !self.isRefreshing && self.switchingAccountName == nil
+    }
 
     func refresh() async {
         self.isRefreshing = true
@@ -811,14 +906,45 @@ final class UsageController {
     }
 
     func switchToAccount(named name: String) async {
-        self.isRefreshing = true
-        defer { self.isRefreshing = false }
+        self.startSwitching(to: name)
+        await self.finishSwitching(to: name)
+    }
+
+    func startSwitching(to name: String) {
+        let displayName = self.displayName(for: name)
+        self.switchingAccountName = name
+        self.lastError = nil
+        self.statusMessage = "Switching to \(displayName)..."
+        self.markActiveAccount(named: name)
+    }
+
+    func finishSwitching(to name: String) async {
         do {
             try CodexProfileStore.switchToProfile(named: name)
             await self.refresh()
+            self.statusMessage = "Switched to \(self.displayName(for: name))"
         } catch {
+            await self.refresh()
             self.lastError = error.localizedDescription
+            self.statusMessage = nil
         }
+        self.switchingAccountName = nil
+    }
+
+    private func markActiveAccount(named name: String) {
+        self.accounts = self.accounts
+            .map { $0.withActive($0.name == name) }
+            .sorted { lhs, rhs in
+                if lhs.active != rhs.active { return lhs.active && !rhs.active }
+                return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
+            }
+    }
+
+    private func displayName(for name: String) -> String {
+        if let account = self.accounts.first(where: { $0.name == name }) {
+            return account.displayName
+        }
+        return name
     }
 
     func balanceNow(settings: LoadBalancerSettings) async {
@@ -867,6 +993,15 @@ final class UsageController {
     func addCurrentAccount(named name: String) async {
         do {
             try CodexProfileStore.addCurrentProfile(named: name.trimmingCharacters(in: .whitespacesAndNewlines))
+            await self.refresh()
+        } catch {
+            self.lastError = error.localizedDescription
+        }
+    }
+
+    func deleteAccount(named name: String) async {
+        do {
+            try CodexProfileStore.deleteProfile(named: name)
             await self.refresh()
         } catch {
             self.lastError = error.localizedDescription
@@ -923,6 +1058,16 @@ struct CodexAccountUsage: Identifiable, Sendable {
             return UsageText.comeback(snapshot) ?? "wasted"
         }
         return UsageText.summary(snapshot)
+    }
+
+    func withActive(_ active: Bool) -> CodexAccountUsage {
+        CodexAccountUsage(
+            name: self.name,
+            label: self.label,
+            active: active,
+            lastSelectedAt: self.lastSelectedAt,
+            snapshot: self.snapshot,
+            error: self.error)
     }
 }
 
@@ -1110,7 +1255,9 @@ enum CodexProfileStore {
         let current = Self.activeProfileName()
         if let current, current != name {
             let currentHome = Self.codexProfilesRoot.appendingPathComponent(current)
-            try Self.copySwitchedFiles(from: Self.liveCodexHome, to: currentHome)
+            if Self.profilesHaveMatchingIdentity(Self.liveCodexHome, currentHome) {
+                try Self.copySwitchedFiles(from: Self.liveCodexHome, to: currentHome)
+            }
         }
 
         try Self.backupLiveCodexHome()
@@ -1163,6 +1310,19 @@ enum CodexProfileStore {
         try Self.saveConfig(config)
     }
 
+    static func deleteProfile(named name: String) throws {
+        let target = Self.codexProfilesRoot.appendingPathComponent(name)
+        guard FileManager.default.fileExists(atPath: target.path) else { return }
+        try FileManager.default.removeItem(at: target)
+
+        var config = (try? Self.loadConfig()) ?? CodexMaxxConfig.empty
+        config.profiles.removeValue(forKey: name)
+        if config.active == name {
+            config.active = nil
+        }
+        try Self.saveConfig(config)
+    }
+
     private static func backupLiveCodexHome() throws {
         let stamp = ISO8601DateFormatter()
             .string(from: Date())
@@ -1183,6 +1343,46 @@ enum CodexProfileStore {
                 try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: destinationURL.path)
             }
         }
+    }
+
+    private static func profilesHaveMatchingIdentity(_ lhs: URL, _ rhs: URL) -> Bool {
+        guard let lhsIdentity = Self.profileIdentity(at: lhs),
+              let rhsIdentity = Self.profileIdentity(at: rhs) else {
+            return true
+        }
+        return lhsIdentity == rhsIdentity
+    }
+
+    private static func profileIdentity(at home: URL) -> String? {
+        let url = home.appendingPathComponent("auth.json")
+        guard let data = try? Data(contentsOf: url),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let tokens = json["tokens"] as? [String: Any] else {
+            return nil
+        }
+        if let accountId = Self.nonEmptyString(tokens["account_id"]) ?? Self.nonEmptyString(tokens["accountId"]) {
+            return "account:\(accountId)"
+        }
+        if let email = Self.email(fromIDToken: Self.nonEmptyString(tokens["id_token"]) ?? Self.nonEmptyString(tokens["idToken"])) {
+            return "email:\(email.lowercased())"
+        }
+        return nil
+    }
+
+    private static func nonEmptyString(_ value: Any?) -> String? {
+        (value as? String).flatMap { $0.isEmpty ? nil : $0 }
+    }
+
+    private static func email(fromIDToken token: String?) -> String? {
+        guard let token else { return nil }
+        let parts = token.split(separator: ".")
+        guard parts.count >= 2 else { return nil }
+        var base64 = String(parts[1]).replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+        while base64.count % 4 != 0 { base64.append("=") }
+        guard let data = Data(base64Encoded: base64),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        let profile = json["https://api.openai.com/profile"] as? [String: Any]
+        return json["email"] as? String ?? profile?["email"] as? String
     }
 
     private static func activeProfileName() -> String? {
