@@ -1348,7 +1348,7 @@ enum CodexProfileStore {
     private static func profilesHaveMatchingIdentity(_ lhs: URL, _ rhs: URL) -> Bool {
         guard let lhsIdentity = Self.profileIdentity(at: lhs),
               let rhsIdentity = Self.profileIdentity(at: rhs) else {
-            return true
+            return false
         }
         return lhsIdentity == rhsIdentity
     }
