@@ -14,6 +14,7 @@ Download the latest stable build from [releaseflow.net/kitze/codexmaxx](https://
 
 - Combined or active-account menu bar usage.
 - Session and weekly Codex quota display.
+- Available Codex reset credit count and next expiration for saved accounts.
 - Account switching without a CLI, including click-to-switch account cards.
 - Profile deletion from account menus.
 - Main dashboard with account grid, weekly usage chart, and GitHub-style activity graph.
