@@ -537,10 +537,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.statusItem.button?.image = nil
             self.statusItem.button?.title = "codexmaxx"
         } else {
+            let activeResetCredits = rows.first(where: \.active)?.resetCredits
             let source = self.settings.source == .active
                 ? rows.first(where: \.active)?.snapshot
                 : UsageMath.combined(rows.map(\.snapshot))
-            self.renderStatusItem(snapshot: source)
+            self.renderStatusItem(snapshot: source, resetCredits: activeResetCredits)
         }
         self.renderSessionStatusItem()
         self.handleIdleSessionSound()
@@ -553,7 +554,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.settingsWindowHost?.rootView = self.makeSettingsWindowContent()
     }
 
-    private func renderStatusItem(snapshot: UsageSnapshot?) {
+    private func renderStatusItem(snapshot: UsageSnapshot?, resetCredits: CodexResetCreditsSnapshot?) {
         guard let snapshot else {
             self.statusItem.length = NSStatusItem.variableLength
             self.statusItem.button?.image = nil
@@ -565,12 +566,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .inline:
             self.statusItem.length = NSStatusItem.variableLength
             self.statusItem.button?.image = nil
-            self.statusItem.button?.title = UsageText.menuBarSummary(snapshot, settings: self.settings)
+            self.statusItem.button?.title = UsageText.menuBarSummary(snapshot, resetCredits: resetCredits, settings: self.settings)
         case .stacked, .circles:
             self.statusItem.button?.title = ""
             let image = MenuBarIconRenderer.image(snapshot: snapshot, settings: self.settings)
             self.statusItem.length = image.size.width + 8
             self.statusItem.button?.image = image
+            self.statusItem.button?.toolTip = resetCredits.map { "Codex resets: \($0.availableCount)" }
         }
     }
 
@@ -963,7 +965,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 final class HostingMenuView<Content: View>: NSHostingView<Content> {
     required init(rootView: Content) {
         super.init(rootView: rootView)
-        self.frame = NSRect(x: 0, y: 0, width: 340, height: 280)
+        self.frame = NSRect(x: 0, y: 0, width: 340, height: 330)
     }
 
     @available(*, unavailable)
@@ -1117,6 +1119,9 @@ struct MainWindowContent: View {
                             SummaryPanel(title: "Sessions", value: "\(controller.sessionStatus.count)", detail: controller.sessionStatus.detail)
                             if let combined = UsageMath.combined(controller.accounts.map(\.snapshot)) {
                                 SummaryUsagePanel(snapshot: combined)
+                            }
+                            if let resetCredits = controller.accounts.first(where: \.active)?.resetCredits {
+                                SummaryResetCreditsPanel(snapshot: resetCredits)
                             }
                         }
 
@@ -1400,6 +1405,54 @@ struct SummaryUsagePanel: View {
     }
 }
 
+struct SummaryResetCreditsPanel: View {
+    let snapshot: CodexResetCreditsSnapshot
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Codex Resets")
+                .font(.subheadline.weight(.medium))
+                .foregroundStyle(.secondary)
+
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Text("\(snapshot.availableCount)")
+                    .font(.title2.weight(.semibold))
+                Text(snapshot.availableCount == 1 ? "available reset" : "available resets")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            VStack(alignment: .leading, spacing: 3) {
+                if snapshot.expirationLines.isEmpty {
+                    Text(snapshot.summaryDetail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                } else {
+                    ForEach(Array(snapshot.expirationLines.prefix(3).enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                    if snapshot.expirationLines.count > 3 {
+                        Text("+ \(snapshot.expirationLines.count - 3) more")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .frame(minHeight: 92, alignment: .topLeading)
+        .padding(16)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+        .overlay(RoundedRectangle(cornerRadius: 12).stroke(Color.secondary.opacity(0.15), lineWidth: 1))
+        .help(snapshot.helpText)
+    }
+}
+
 struct EmptyAccountsPanel: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -1499,6 +1552,12 @@ struct MainAccountCard: View {
                         .font(.system(.caption, design: .monospaced))
                         .foregroundStyle(isSwitching || account.isWasted ? .secondary : .primary)
                     Spacer()
+                    if let resetCredits = account.resetCredits {
+                        Text("R \(resetCredits.availableCount)")
+                            .font(.system(.caption, design: .monospaced).weight(.semibold))
+                            .foregroundStyle(resetCredits.availableCount > 0 ? Color.accentColor : Color.secondary)
+                            .help(resetCredits.helpText)
+                    }
                 }
             }
             .padding(16)
@@ -2287,9 +2346,21 @@ struct AccountRow: View {
 
                     Spacer()
 
-                    Text(isSwitching ? "switching" : account.statusText)
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(isSwitching || wasted ? .secondary : .primary)
+                    VStack(alignment: .trailing, spacing: 2) {
+                        Text(isSwitching ? "switching" : account.statusText)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(isSwitching || wasted ? .secondary : .primary)
+                        if let resetCredits = account.resetCredits {
+                            HStack(spacing: 3) {
+                                Image(systemName: "arrow.counterclockwise")
+                                    .font(.system(size: 9, weight: .semibold))
+                                Text(resetCredits.menuRowSummary)
+                            }
+                            .font(.caption2.weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .help(resetCredits.helpText)
+                        }
+                    }
                 }
 
                 if let snapshot = account.snapshot {
@@ -2648,6 +2719,8 @@ struct CodexAccountUsage: Identifiable, Sendable {
     let active: Bool
     let lastSelectedAt: Double?
     let snapshot: UsageSnapshot?
+    let resetCredits: CodexResetCreditsSnapshot?
+    let resetCreditsError: String?
     let error: String?
 
     var displayName: String {
@@ -2687,6 +2760,8 @@ struct CodexAccountUsage: Identifiable, Sendable {
             active: active,
             lastSelectedAt: self.lastSelectedAt,
             snapshot: self.snapshot,
+            resetCredits: self.resetCredits,
+            resetCreditsError: self.resetCreditsError,
             error: self.error)
     }
 }
@@ -3184,12 +3259,26 @@ enum CodexUsageLoader {
                 env: env)
             let snapshot = CodexReconciledState
                 .fromOAuth(response: response, credentials: credentials)
+            let resetCredits: CodexResetCreditsSnapshot?
+            let resetCreditsError: String?
+            do {
+                resetCredits = try await CodexResetCreditsFetcher.fetchResetCredits(
+                    accessToken: credentials.accessToken,
+                    accountId: credentials.accountId,
+                    env: env)
+                resetCreditsError = nil
+            } catch {
+                resetCredits = nil
+                resetCreditsError = error.localizedDescription
+            }
             return CodexAccountUsage(
                 name: profile.name,
                 label: profile.label,
                 active: profile.active,
                 lastSelectedAt: profile.lastSelectedAt,
                 snapshot: snapshot,
+                resetCredits: resetCredits,
+                resetCreditsError: resetCreditsError,
                 error: snapshot == nil ? "No rate limits returned" : nil)
         } catch {
             return CodexAccountUsage(
@@ -3198,6 +3287,8 @@ enum CodexUsageLoader {
                 active: profile.active,
                 lastSelectedAt: profile.lastSelectedAt,
                 snapshot: nil,
+                resetCredits: nil,
+                resetCreditsError: nil,
                 error: error.localizedDescription)
         }
     }
@@ -3314,6 +3405,13 @@ enum UsageText {
         return formatter.string(from: date)
     }
 
+    static func fullDateTime(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+
     static func summary(_ snapshot: UsageSnapshot) -> String {
         let primary = snapshot.primary.map(Self.capacity) ?? "--"
         let secondary = snapshot.secondary.map(Self.capacity) ?? "--"
@@ -3326,13 +3424,16 @@ enum UsageText {
         return "S \(primary)  W \(secondary)"
     }
 
-    static func menuBarSummary(_ snapshot: UsageSnapshot, settings: DisplaySettings) -> String {
+    static func menuBarSummary(_ snapshot: UsageSnapshot, resetCredits: CodexResetCreditsSnapshot?, settings: DisplaySettings) -> String {
         var parts: [String] = []
         if settings.windows != .week {
             parts.append("\(settings.label(for: .session).isEmpty ? "S" : settings.label(for: .session)) \(snapshot.primary.map(Self.capacity) ?? "?")")
         }
         if settings.windows != .session {
             parts.append("\(settings.label(for: .week).isEmpty ? "W" : settings.label(for: .week)) \(snapshot.secondary.map(Self.capacity) ?? "?")")
+        }
+        if let resetCredits {
+            parts.append("R \(resetCredits.menuBarSummary)")
         }
         return parts.joined(separator: " ")
     }
@@ -3426,6 +3527,20 @@ enum UsageText {
         return "in \(totalMinutes)m"
     }
 
+    static func compactCountdown(to date: Date, now: Date = Date()) -> String {
+        let seconds = max(0, Int(date.timeIntervalSince(now)))
+        let days = seconds / 86_400
+        let hours = (seconds % 86_400) / 3_600
+        let minutes = (seconds % 3_600) / 60
+        if days > 0 {
+            return hours > 0 ? "\(days)d\(hours)h" : "\(days)d"
+        }
+        if hours > 0 {
+            return minutes > 0 ? "\(hours)h\(minutes)m" : "\(hours)h"
+        }
+        return "\(max(1, minutes))m"
+    }
+
     private static func resetLine(for window: RateWindow, label: String, now: Date) -> String? {
         if let reset = window.resetsAt {
             return "\(label) resets \(self.resetCountdownDescription(from: reset, now: now))"
@@ -3475,6 +3590,124 @@ struct UsageSnapshot: Codable, Sendable {
         self.secondary = secondary
         self.updatedAt = updatedAt
         self.identity = identity
+    }
+}
+
+struct CodexResetCredit: Identifiable, Sendable {
+    let id: String
+    let status: String?
+    let expiresAt: Date?
+
+    var isAvailable: Bool {
+        (self.status ?? "").lowercased() == "available"
+    }
+}
+
+struct CodexResetCreditsSnapshot: Sendable {
+    let availableCount: Int
+    let credits: [CodexResetCredit]
+    let updatedAt: Date
+
+    var availableCredits: [CodexResetCredit] {
+        self.credits.filter(\.isAvailable)
+            .sorted {
+                ($0.expiresAt ?? .distantFuture) < ($1.expiresAt ?? .distantFuture)
+            }
+    }
+
+    var nextExpiration: Date? {
+        self.availableCredits.compactMap(\.expiresAt).first
+    }
+
+    var summaryDetail: String {
+        guard let nextExpiration else {
+            return self.availableCount == 0 ? "No available resets" : "Expiration unknown"
+        }
+        return "Next expires \(UsageText.resetCountdownDescription(from: nextExpiration))"
+    }
+
+    var menuBarSummary: String {
+        guard let nextExpiration else { return "\(self.availableCount)" }
+        return "\(self.availableCount) \(UsageText.compactCountdown(to: nextExpiration))"
+    }
+
+    var menuRowSummary: String {
+        let label = self.availableCount == 1 ? "reset" : "resets"
+        guard let nextExpiration else { return "\(self.availableCount) \(label)" }
+        return "\(self.availableCount) \(label) · \(UsageText.compactCountdown(to: nextExpiration))"
+    }
+
+    var expirationLines: [String] {
+        self.availableCredits.enumerated().map { index, credit in
+            guard let expiresAt = credit.expiresAt else {
+                return "Reset \(index + 1): expiration unknown"
+            }
+            return "Reset \(index + 1): \(UsageText.fullDateTime(expiresAt))"
+        }
+    }
+
+    var helpText: String {
+        let available = self.availableCredits
+        guard !available.isEmpty else { return "No available Codex reset credits" }
+        return available.enumerated().map { index, credit in
+            guard let expiresAt = credit.expiresAt else {
+                return "\(index + 1). expiration unknown"
+            }
+            return "\(index + 1). expires \(UsageText.fullDateTime(expiresAt)) (\(UsageText.resetCountdownDescription(from: expiresAt)))"
+        }.joined(separator: "\n")
+    }
+}
+
+struct CodexResetCreditsResponse: Decodable, Sendable {
+    let availableCount: Int?
+    let credits: [Credit]
+
+    enum CodingKeys: String, CodingKey {
+        case availableCount = "available_count"
+        case credits
+    }
+
+    struct Credit: Decodable, Sendable {
+        let id: String?
+        let status: String?
+        let expiresAt: Date?
+
+        enum CodingKeys: String, CodingKey {
+            case id
+            case status
+            case expiresAt = "expires_at"
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            self.id = try container.decodeIfPresent(String.self, forKey: .id)
+            self.status = try container.decodeIfPresent(String.self, forKey: .status)
+            self.expiresAt = Self.decodeDate(container, forKey: .expiresAt)
+        }
+
+        private static func decodeDate(_ container: KeyedDecodingContainer<CodingKeys>, forKey key: CodingKeys) -> Date? {
+            if let value = try? container.decode(Double.self, forKey: key) {
+                return Date(timeIntervalSince1970: value > 10_000_000_000 ? value / 1000 : value)
+            }
+            if let value = try? container.decode(Int.self, forKey: key) {
+                let seconds = Double(value)
+                return Date(timeIntervalSince1970: seconds > 10_000_000_000 ? seconds / 1000 : seconds)
+            }
+            guard let value = try? container.decode(String.self, forKey: key), !value.isEmpty else {
+                return nil
+            }
+            if let seconds = Double(value) {
+                return Date(timeIntervalSince1970: seconds > 10_000_000_000 ? seconds / 1000 : seconds)
+            }
+            let fractional = ISO8601DateFormatter()
+            fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+            if let date = fractional.date(from: value) {
+                return date
+            }
+            let plain = ISO8601DateFormatter()
+            plain.formatOptions = [.withInternetDateTime]
+            return plain.date(from: value)
+        }
     }
 }
 
@@ -3606,7 +3839,7 @@ enum CodexOAuthUsageFetcher {
         return try JSONDecoder().decode(CodexUsageResponse.self, from: data)
     }
 
-    private static func chatGPTBaseURL(env: [String: String]) -> String {
+    static func chatGPTBaseURL(env: [String: String]) -> String {
         let home = env["CODEX_HOME"].flatMap { $0.isEmpty ? nil : $0 }
             ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex").path
         let config = URL(fileURLWithPath: home).appendingPathComponent("config.toml")
@@ -3628,6 +3861,45 @@ enum CodexOAuthUsageFetcher {
             return parts[1].trimmingCharacters(in: CharacterSet(charactersIn: "\"'"))
         }
         return nil
+    }
+}
+
+enum CodexResetCreditsFetcher {
+    static func fetchResetCredits(accessToken: String, accountId: String?, env: [String: String]) async throws -> CodexResetCreditsSnapshot {
+        let base = CodexOAuthUsageFetcher.chatGPTBaseURL(env: env)
+        guard let url = URL(string: base + "/wham/rate-limit-reset-credits") else {
+            throw NSError(domain: "CodexMaxx", code: 30, userInfo: [NSLocalizedDescriptionKey: "Invalid reset credits URL"])
+        }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 25
+        request.setValue("Bearer \(accessToken)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        request.setValue("Codex Desktop", forHTTPHeaderField: "originator")
+        request.setValue("CodexMaxx", forHTTPHeaderField: "User-Agent")
+        if let accountId, !accountId.isEmpty {
+            request.setValue(accountId, forHTTPHeaderField: "ChatGPT-Account-ID")
+        }
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw NSError(domain: "CodexMaxx", code: 31, userInfo: [NSLocalizedDescriptionKey: "Invalid reset credits response"])
+        }
+        guard (200...299).contains(http.statusCode) else {
+            throw NSError(domain: "CodexMaxx", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: "Reset credits API returned \(http.statusCode)"])
+        }
+
+        let decoded = try JSONDecoder().decode(CodexResetCreditsResponse.self, from: data)
+        let credits = decoded.credits.enumerated().map { index, credit in
+            CodexResetCredit(
+                id: credit.id ?? "\(index)-\(credit.expiresAt?.timeIntervalSince1970 ?? 0)",
+                status: credit.status,
+                expiresAt: credit.expiresAt)
+        }
+        let availableCredits = credits.filter(\.isAvailable)
+        return CodexResetCreditsSnapshot(
+            availableCount: decoded.availableCount ?? availableCredits.count,
+            credits: credits,
+            updatedAt: Date())
     }
 }
 
